@@ -8,6 +8,10 @@ import streamlit as st
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from utils import normalize_activities_df
+from vendors import get_potential_vendors_for_topics
+from scoring import apply_intent_scoring
+from external_triggers import find_best_trigger_for_company
 
 # ------------------------
 # LSC Buyer Journey Intelligence Engine
@@ -116,7 +120,7 @@ def detect_behavioral_triggers_and_flags(group_df: pd.DataFrame):
     # Requirement: any flags or explanation text derived from activity/source
     # should appear only when the activity source itself is a non-empty, non-newsletter value.
     # Treat empty or missing activity_source as unknown and DO NOT count it as non-newsletter.
-    asrc = group_df.get("activity_source", pd.Series([""] * len(group_df))).fillna("").astype(str).str.lower().str.strip()
+    asrc = group_df.get("activity_source", pd.Series([""] * len(group_df))).astype(object).fillna("").astype(str).str.lower().str.strip()
     # strict match for the word 'newsletter' to avoid partial matches
     is_news = asrc.str.contains(r"\bnewsletter\b", na=False)
     # Only treat rows as non-newsletter WHEN the activity_source explicitly contains
@@ -392,7 +396,22 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
         g = g.sort_values(by=["activity_date"]) if "activity_date" in g.columns else g
         first = g.iloc[0]
         total_eng = int(g["activity_date"].count()) if "activity_date" in g.columns else g.shape[0]
+        # last activity date
+        last_dt = None
+        if "activity_date" in g.columns:
+            try:
+                last_dt = pd.to_datetime(g["activity_date"], errors="coerce").max()
+            except Exception:
+                last_dt = None
 
+        # Non-newsletter engagement count (conservative): count activity_source rows
+        # that are non-empty and do NOT explicitly contain the word 'newsletter'
+        try:
+            asrc = g.get("activity_source", pd.Series([""] * len(g))).astype(object).fillna("").astype(str)
+            non_nl_mask = ~asrc.str.contains(r"\bnewsletter\b", na=False, case=False) & asrc.str.strip().ne("")
+            non_nl_count = int(non_nl_mask.sum())
+        except Exception:
+            non_nl_count = 0
         # Primary topic from group
         primary_topic = extract_primary_topic(g.iloc[0] if not g.empty else {})
         if not primary_topic:
@@ -448,6 +467,8 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
             "Last Name": first.get("last_name", ""),
             "Title": first.get("title", ""),
             "Total Engagements": total_eng,
+            "Last_Activity_Date": last_dt,
+            "Non_NL_Engagements": non_nl_count,
             "Buyer_Journey_Label": label,
             "Explanation": explanation,
             "Primary_Topic": primary_topic,
@@ -464,6 +485,26 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
     # ensure numeric
     if "Total Engagements" in individuals_df.columns:
         individuals_df["Total Engagements"] = individuals_df["Total Engagements"].astype(int)
+
+    # Prepare for intent scoring: scoring expects `Total_Engagements`, `Last_Activity_Date`,
+    # `Non_NL_Engagements`, `Buyer_Journey_Label`, `Vendors_Evaluated`, and `Reader Company`.
+    indiv_for_scoring = individuals_df.copy()
+    # create a scoring-friendly column name
+    if "Total Engagements" in indiv_for_scoring.columns and "Total_Engagements" not in indiv_for_scoring.columns:
+        indiv_for_scoring["Total_Engagements"] = indiv_for_scoring["Total Engagements"].astype(int)
+    # company aggregation for team buying
+    comp_agg = indiv_for_scoring.groupby("Reader Company").agg(Company_Contact_Count=("Reader Company", "count")).reset_index()
+    # attempt to compute intent scoring and derived buyer journey; fall back gracefully on error
+    try:
+        scored = apply_intent_scoring(indiv_for_scoring, comp_agg)
+        # ensure we keep the original display naming
+        if "Total_Engagements" in scored.columns and "Total Engagements" not in scored.columns:
+            scored["Total Engagements"] = scored["Total_Engagements"].astype(int)
+        individuals_df = scored
+    except Exception:
+        # scoring failed — ensure Derived_Buyer_Journey exists as a fallback copy
+        if "Derived_Buyer_Journey" not in individuals_df.columns:
+            individuals_df["Derived_Buyer_Journey"] = individuals_df.get("Buyer_Journey_Label", "")
 
     # filter by min engagements
     individuals_filtered = individuals_df[individuals_df["Total Engagements"] >= int(min_engagements)].copy()
@@ -637,21 +678,206 @@ def main():
         st.error(f"Failed to read file: {e}")
         return
 
-    # Normalize columns immediately after upload and show normalized column list for debugging
+    # If user provided a sandbox-style file with `User ID`, use the new
+    # normalization + scoring pipeline that preserves company/title and drops PII.
+    cols_lc = {c.strip().lower(): c for c in df.columns}
+    if "user id" in cols_lc:
+        # Normalize and remove PII
+        try:
+            df2 = normalize_activities_df(df)
+        except Exception as e:
+            st.error(f"Failed to normalize uploaded file with User ID pipeline: {e}")
+            return
+
+        # Build individuals aggregated by User ID
+        groups = df2.groupby("User ID")
+        indiv_records = []
+        for uid, g in groups:
+            # reader company: most common non-empty
+            rc = ""
+            try:
+                rc = g["Reader Company"].dropna().astype(str).str.strip()
+                rc = rc[rc != ""].mode().iloc[0] if not rc[rc != ""].empty else ""
+            except Exception:
+                rc = ""
+
+            title = ""
+            try:
+                t = g["Title"].dropna().astype(str).str.strip()
+                title = t.mode().iloc[0] if not t.empty else ""
+            except Exception:
+                title = ""
+
+            total_eng = int(len(g))
+
+            # Non-newsletter engagements heuristic
+            asrc = g.get("Activity Source", pd.Series([""] * len(g))).astype(object).fillna("").astype(str)
+            non_nl_mask = ~asrc.str.contains(r"\bnewsletter\b", na=False, case=False) & asrc.str.strip().ne("")
+            non_nl_count = int(non_nl_mask.sum())
+
+            last_dt = None
+            if "Activity Date" in g.columns:
+                try:
+                    last_dt = pd.to_datetime(g["Activity Date"], errors="coerce").max()
+                except Exception:
+                    last_dt = None
+
+            # Primary topic
+            primary_topic = ""
+            try:
+                primary_topic = extract_primary_topic({
+                    "content_topics": ", ".join([str(x) for x in g.get("Content Topics", []) if not pd.isna(x)]),
+                    "content_title": ", ".join([str(x) for x in g.get("Content Title", []) if not pd.isna(x)]),
+                    "specifics": ", ".join([str(x) for x in g.get("Specifics", []) if not pd.isna(x)]),
+                })
+            except Exception:
+                primary_topic = ""
+
+            vendors_eval = ""
+            try:
+                vendors_eval = extract_vendors_evaluated({
+                    "content_source": ", ".join([str(x) for x in g.get("Content Source", []) if not pd.isna(x)]),
+                    "specifics": ", ".join([str(x) for x in g.get("Specifics", []) if not pd.isna(x)]),
+                    "client": ", ".join([str(x) for x in g.get("Client", []) if not pd.isna(x)]),
+                    "newsletter_name": ", ".join([str(x) for x in g.get("Newsletter Name", []) if not pd.isna(x)]),
+                })
+            except Exception:
+                vendors_eval = ""
+
+            # Potential vendors
+            pv_list = get_potential_vendors_for_topics([t.strip() for t in str(primary_topic).split(",") if t.strip()])
+
+            # Buyer journey label (best-effort)
+            bj_label = stage_from_text(primary_topic)
+
+            indiv_records.append({
+                "User ID": uid,
+                "Reader Company": rc,
+                "Title": title,
+                "Total_Engagements": total_eng,
+                "Non_NL_Engagements": non_nl_count,
+                "Last_Activity_Date": last_dt,
+                "Primary_Topic": primary_topic,
+                "Buyer_Journey_Label": bj_label,
+                "Vendors_Evaluated": vendors_eval,
+                "Potential_Vendors": ", ".join(pv_list),
+            })
+
+        individuals_df = pd.DataFrame.from_records(indiv_records)
+
+        # Company aggregation: distinct user id counts
+        comp_agg = individuals_df.groupby("Reader Company").agg(Company_Contact_Count=("User ID", lambda s: s.nunique())).reset_index()
+
+        # Apply intent scoring
+        try:
+            individuals_scored = apply_intent_scoring(individuals_df.rename(columns={"Total_Engagements": "Total_Engagements"}), comp_agg)
+        except Exception as e:
+            st.error(f"Failed to compute intent scoring: {e}")
+            return
+
+        # Build a company-level summary that includes team buying (Yes/No),
+        # max intent, count of high-intent contacts, and best external trigger
+        inds = individuals_scored.copy()
+        # ensure Intent_Score available (if scoring used Intent_Base only, fall back)
+        if "Intent_Score" not in inds.columns and "Intent_Base_Score" in inds.columns:
+            inds["Intent_Score"] = inds["Intent_Base_Score"].fillna(0).astype(int)
+
+        comp_rows = []
+        comp_grp = inds.groupby("Reader Company") if not inds.empty else []
+        for comp, cg in comp_grp:
+            contact_count = int(cg["User ID"].nunique()) if "User ID" in cg.columns else int(cg.shape[0])
+            max_intent = int(cg["Intent_Score"].fillna(0).astype(int).max()) if "Intent_Score" in cg.columns else 0
+            num_high = int((cg.get("Intent_Score", 0) >= 60).sum()) if "Intent_Score" in cg.columns else 0
+
+            # choose best external trigger from individuals if present
+            ext_title = ""
+            ext_url = ""
+            ext_type = ""
+            # prefer an external trigger present on any contact
+            if "External_Trigger_Title" in cg.columns:
+                nonempty = cg[cg["External_Trigger_Title"].astype(str).str.strip() != ""]
+                if not nonempty.empty:
+                    first = nonempty.iloc[0]
+                    ext_title = str(first.get("External_Trigger_Title", ""))
+                    ext_url = str(first.get("External_Trigger_URL", "")) if "External_Trigger_URL" in first else ""
+                    ext_type = str(first.get("External_Trigger_Type", "")) if "External_Trigger_Type" in first else ""
+
+            # If company is high-intent by max score but no individual trigger found, fetch company-level trigger
+            if max_intent >= 60 and not ext_url:
+                try:
+                    best = find_best_trigger_for_company(comp)
+                    if best:
+                        ext_title = best.get("external_trigger_title", "")
+                        ext_url = best.get("external_trigger_url", "")
+                        ext_type = best.get("external_trigger_type", "")
+                except Exception:
+                    pass
+
+            team_buying = "Yes" if contact_count >= 2 else "No"
+            high_intent_flag = "Yes" if (max_intent >= 60 or num_high >= 1) else "No"
+
+            comp_rows.append({
+                "Company": comp,
+                "Company_Contact_Count": contact_count,
+                "Team_Buying": team_buying,
+                "Max_Intent_Score": max_intent,
+                "Num_High_Intent_Contacts": num_high,
+                "External_Trigger_Title": ext_title,
+                "External_Trigger_URL": ext_url,
+                "External_Trigger_Type": ext_type,
+                "High_Intent_Flag": high_intent_flag,
+            })
+
+        company_summary = pd.DataFrame.from_records(comp_rows)
+
+        # Build sales hot list: only include individuals with Intent_Score > 70
+        if "Intent_Score" in individuals_scored.columns:
+            sales_hot = individuals_scored[individuals_scored["Intent_Score"] > 70].copy()
+        else:
+            # no intent score available, produce empty sales hot list
+            sales_hot = individuals_scored.iloc[0:0].copy()
+
+        results = {
+            "individuals": individuals_scored.rename(columns={"Total_Engagements": "Total Engagements"}),
+            "company_combined": comp_agg.rename(columns={"Reader Company": "Company"}),
+            "company_summary": company_summary,
+            "product_map": pd.DataFrame(),
+            "sales_hot_list": sales_hot,
+            "raw": df2,
+        }
+
+    else:
+        # Normalize columns immediately after upload and show normalized column list for debugging
+        try:
+            df = normalize_columns(df)
+        except ValueError as e:
+            st.error(str(e))
+            st.write("Columns found:", list(df.columns))
+            return
+
+    # Remove legacy 'Buyer_Journey_Label' from results to avoid showing the old label
+    # Prefer derived or original intent-based labels instead.
     try:
-        df = normalize_columns(df)
-    except ValueError as e:
-        st.error(str(e))
-        st.write("Columns found:", list(df.columns))
-        return
+        for k in ("individuals", "sales_hot_list", "company_combined", "company_summary"):
+            if k in locals():
+                pass
+        if 'results' in locals() and isinstance(results, dict):
+            for key in ("individuals", "sales_hot_list", "company_combined", "company_summary"):
+                df_k = results.get(key)
+                if df_k is not None and hasattr(df_k, 'columns') and 'Buyer_Journey_Label' in df_k.columns:
+                    results[key] = df_k.drop(columns=['Buyer_Journey_Label'])
+    except Exception:
+        # non-fatal: continue without removal if something unexpected occurs
+        pass
 
     # Show normalized columns in a collapsed expander by default to reduce UI clutter
     with st.expander("Normalized Columns (click to expand)", expanded=False):
         st.write(list(df.columns))
 
-    # Process
-    with st.spinner("Processing data — this may take a moment for tens of thousands of rows..."):
-        results = process_dataframe(df, min_engagements=min_eng)
+    # Process (legacy pipeline if not using User ID)
+    if "user id" not in cols_lc:
+        with st.spinner("Processing data — this may take a moment for tens of thousands of rows..."):
+            results = process_dataframe(df, min_engagements=min_eng)
 
     st.success("Processing complete")
 
@@ -663,6 +889,54 @@ def main():
 
     # Sidebar controls
     st.sidebar.markdown("**Display filters (UI only)**")
+    # Product / topic filter (broadened)
+    # gather tokens from Primary_Topic, Content Topics, Product column, and vendor product categories
+    topic_tokens = set()
+    if not inds_all.empty:
+        # Primary_Topic / Primary Topic
+        if "Primary_Topic" in inds_all.columns:
+            for s in inds_all["Primary_Topic"].dropna().astype(str):
+                for t in str(s).split(","):
+                    tt = t.strip()
+                    if tt:
+                        topic_tokens.add(tt)
+        if "Primary Topic" in inds_all.columns:
+            for s in inds_all["Primary Topic"].dropna().astype(str):
+                for t in str(s).split(","):
+                    tt = t.strip()
+                    if tt:
+                        topic_tokens.add(tt)
+
+        # Content Topics column (may be comma-separated)
+        if "Content Topics" in inds_all.columns:
+            for s in inds_all["Content Topics"].dropna().astype(str):
+                for t in str(s).split(","):
+                    tt = t.strip()
+                    if tt:
+                        topic_tokens.add(tt)
+
+        # Product / product column
+        for prod_col in ("Product", "product"):
+            if prod_col in inds_all.columns:
+                for s in inds_all[prod_col].dropna().astype(str):
+                    tt = str(s).strip()
+                    if tt:
+                        topic_tokens.add(tt)
+
+    # include keys from PRODUCT_VENDOR_MAP to help users choose broad categories
+    try:
+        from vendors import PRODUCT_VENDOR_MAP
+        for k in PRODUCT_VENDOR_MAP.keys():
+            topic_tokens.add(k)
+            # also add shorter tokens from the key
+            for tok in k.split():
+                if len(tok) > 3:
+                    topic_tokens.add(tok)
+    except Exception:
+        pass
+
+    topic_options = sorted(topic_tokens)
+    selected_topics = st.sidebar.multiselect("Product / Topic filter", options=topic_options, default=[], key="topic_filter")
     if not inds_all.empty:
         # Gather potential vendors and evaluated vendors as option lists
         pv_series = inds_all.get("Potential_Vendors", pd.Series(dtype=object)).dropna().astype(str)
@@ -679,6 +953,8 @@ def main():
 
         top_n = st.sidebar.slider("Top N engaged people (0 = off)", 0, 50, 0, key="top_n")
         only_vendor_eval = st.sidebar.checkbox("Only Vendor Evaluation stage", value=False, key="only_vendor_eval")
+        # allow user to prefer the intent-derived buyer journey when available
+        prefer_derived_stage = st.sidebar.checkbox("Prefer stage from intent (derived)", value=True, key="prefer_derived_stage")
 
         # Reset filters button: clears UI-only selections (does not affect Excel export)
         if st.sidebar.button("Reset filters"):
@@ -690,24 +966,38 @@ def main():
 
         # Apply filters to a display copy
         filt = pd.Series(True, index=inds_all.index)
+        if selected_topics:
+            topic_mask = pd.Series(False, index=inds_all.index)
+            for t in selected_topics:
+                topic_mask |= inds_all.get("Primary_Topic", pd.Series("", index=inds_all.index)).astype(object).fillna("").astype(str).str.contains(re.escape(t), case=False, na=False)
+            filt &= topic_mask
         if selected_pv:
             pv_mask = pd.Series(False, index=inds_all.index)
             for v in selected_pv:
-                pv_mask |= inds_all.get("Potential_Vendors", pd.Series("", index=inds_all.index)).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
+                pv_mask |= inds_all.get("Potential_Vendors", pd.Series("", index=inds_all.index)).astype(object).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
             filt &= pv_mask
         if selected_ev:
             ev_mask = pd.Series(False, index=inds_all.index)
             for v in selected_ev:
-                ev_mask |= inds_all.get("Vendors_Evaluated", pd.Series("", index=inds_all.index)).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
+                ev_mask |= inds_all.get("Vendors_Evaluated", pd.Series("", index=inds_all.index)).astype(object).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
             filt &= ev_mask
 
         if min_eng_display:
             if "Total Engagements" in inds_all.columns:
                 filt &= inds_all["Total Engagements"] >= int(min_eng_display)
 
-        if only_vendor_eval:
-            if "Buyer_Journey_Label" in inds_all.columns:
-                filt &= inds_all["Buyer_Journey_Label"] == "Vendor Evaluation"
+        # respect user's preference for which Buyer Journey label to use
+        if prefer_derived_stage and "Derived_Buyer_Journey" in inds_all.columns:
+            label_col = "Derived_Buyer_Journey"
+        elif "Derived_Buyer_Journey" in inds_all.columns:
+            label_col = "Derived_Buyer_Journey"
+        elif "Original_Buyer_Journey" in inds_all.columns:
+            label_col = "Original_Buyer_Journey"
+        else:
+            label_col = None
+        if only_vendor_eval and label_col is not None:
+            if label_col in inds_all.columns:
+                filt &= inds_all[label_col] == "Vendor Evaluation"
 
         inds_filtered = inds_all[filt].copy()
         if top_n and top_n > 0 and "Total Engagements" in inds_filtered.columns:
@@ -715,14 +1005,80 @@ def main():
     else:
         inds_filtered = inds_all
 
+    # UI: simplified view toggle and highlighted indicators
     st.subheader("Individuals (filtered)")
-    st.dataframe(inds_filtered.head(200))
+    simple_view = st.sidebar.checkbox("Simplified view (show key columns)", value=True)
+
+    # create a visible 'Priority' indicator column based on Intent_Score
+    disp = inds_filtered.copy()
+    def priority_emoji(row):
+        s = row.get("Intent_Score") if row is not None else None
+        try:
+            s = int(s)
+        except Exception:
+            s = None
+        if s is None:
+            return ""
+        if s >= 85:
+            return "🔥🔥"
+        if s >= 70:
+            return "🔥"
+        if s >= 50:
+            return "⚡"
+        return ""
+
+    if not disp.empty:
+        disp["Priority"] = disp.apply(priority_emoji, axis=1)
+
+    if simple_view:
+        show_cols = [c for c in ["Priority", "User ID", "Reader Company", "Title", "Total Engagements", label_col, "Primary_Topic", "Potential_Vendors", "Vendors_Evaluated", "External_Trigger_Title", "External_Trigger_URL", "Intent_Score", "Intent_Label", "Confidence_Score"] if c in disp.columns]
+        disp_show = disp[show_cols].copy()
+        st.dataframe(disp_show.head(200))
+        with st.expander("Advanced: show all columns"):
+            st.dataframe(disp.head(200))
+    else:
+        st.dataframe(disp.head(200))
+
+    # Top insights: highlight companies with high intent and external triggers
+    st.markdown("**Top Insights**")
+    try:
+        comp_sum = results.get("company_summary")
+        if comp_sum is not None and not comp_sum.empty:
+            top_comp = comp_sum.sort_values(by=["Max_Intent_Score"], ascending=False).head(10)
+            for _, r in top_comp.iterrows():
+                title = r.get("Company", "")
+                score = r.get("Max_Intent_Score", "")
+                ext_title = r.get("External_Trigger_Title", "")
+                ext_url = r.get("External_Trigger_URL", "")
+                line = f"- **{title}** — Intent: {score}"
+                if ext_title and ext_url:
+                    line += f" — [{ext_title}]({ext_url})"
+                elif ext_title:
+                    line += f" — {ext_title}"
+                st.markdown(line)
+    except Exception:
+        pass
 
     st.subheader("Company Summary")
     st.dataframe(results["company_summary"].head(200))
 
     st.subheader("Sales Hot List")
-    st.dataframe(results["sales_hot_list"].head(200))
+    # Enforce sales hot list definition: only show rows with Intent_Score > 70 when available
+    sh = results.get("sales_hot_list", pd.DataFrame()).copy()
+    if not sh.empty:
+        if "Intent_Score" in sh.columns:
+            sh = sh[sh["Intent_Score"] > 70]
+        else:
+            # try to map back to individuals' Intent_Score if present
+            inds = results.get("individuals")
+            if inds is not None and "Intent_Score" in inds.columns and "User ID" in sh.columns:
+                sh = sh.merge(inds[["User ID", "Intent_Score"]], on="User ID", how="left")
+                sh = sh[sh["Intent_Score"] > 70]
+            else:
+                # no intent info; empty result
+                sh = sh.iloc[0:0]
+
+    st.dataframe(sh.head(200))
 
     # optional enrichment
     if enrich:
