@@ -64,6 +64,27 @@ def extract_primary_topic(row):
     return ",".join([t[0] for t in top])
 
 
+def normalize_org_key(name: str) -> str:
+    """Normalize organization name for grouping: lowercase, remove punctuation,
+    strip common business suffixes, and collapse whitespace. Returns a short
+    normalized key used only for grouping (not for display).
+    """
+    if name is None:
+        return ""
+    s = str(name)
+    if s.strip() == "":
+        return ""
+    # lowercase
+    t = s.lower()
+    # remove punctuation
+    t = re.sub(r"[^\w\s]", " ", t)
+    # remove common business suffixes
+    t = re.sub(r"\b(?:inc|incorporated|ltd|limited|llc|gmbh|sas|sa|corp|corporation|co|company|plc|bv|ag|pty|holding|holdings)\b", "", t)
+    # collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 VENDOR_LOOKUP = {
     "manufacturing": ["Cytiva", "Sartorius", "Thermo Fisher Scientific", "Repligen", "Pall (Cytiva)", "MilliporeSigma"],
     "qa/qc": ["Waters", "Agilent", "Thermo Fisher Scientific", "Shimadzu", "SCIEX", "Bruker"],
@@ -508,30 +529,50 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
 
     # filter by min engagements
     individuals_filtered = individuals_df[individuals_df["Total Engagements"] >= int(min_engagements)].copy()
-
-    # Company combined
+    # Company combined (group by normalized Reader Org)
     if individuals_filtered.empty:
-        company_combined = pd.DataFrame(columns=["Company", "Active_Individuals", "Dominant_Topic", "Team_Buying_Signal", "Behavioral_Triggers", "External_Trigger", "Product_Category"])
+        company_combined = pd.DataFrame(columns=["Reader Org", "Active_Individuals", "Dominant_Topic", "Team_Buying_Signal", "Behavioral_Triggers", "External_Trigger", "Product_Category"])
     else:
-        comp_grp = individuals_filtered.groupby("Reader Company")
+        inds_tmp = individuals_filtered.copy()
+        # create a raw Reader Org field: prefer any existing 'Reader Org' else fall back to 'Reader Company'
+        if "Reader Org" in inds_tmp.columns:
+            inds_tmp["Reader_Org_Raw"] = inds_tmp["Reader Org"].astype(str).fillna("").str.strip()
+        else:
+            inds_tmp["Reader_Org_Raw"] = inds_tmp.get("Reader Company", "").astype(str).fillna("").str.strip()
+
+        inds_tmp["Reader_Org_Norm"] = inds_tmp["Reader_Org_Raw"].apply(normalize_org_key)
+
         comp_rows = []
-        for comp, cg in comp_grp:
+        for norm_key, cg in inds_tmp.groupby("Reader_Org_Norm"):
+            # display name: most common original Reader Org text in this normalized group
+            display_name = ""
+            try:
+                modes = cg["Reader_Org_Raw"].mode()
+                if not modes.empty:
+                    display_name = modes.iloc[0]
+                else:
+                    display_name = cg["Reader_Org_Raw"].dropna().astype(str).iloc[0] if not cg["Reader_Org_Raw"].dropna().empty else ""
+            except Exception:
+                display_name = cg["Reader_Org_Raw"].astype(str).iloc[0] if not cg["Reader_Org_Raw"].empty else ""
+
             active_inds = cg.shape[0]
-            # dominant topic: most common Primary_Topic among individuals
             dom = cg["Primary_Topic"].value_counts().idxmax() if cg["Primary_Topic"].notna().any() else ""
             team_signal = "Yes" if active_inds >= 2 else "No"
-            beh = ", ".join(sorted(set(cg["Behavioral_Trigger"].dropna().astype(str).tolist())))
-            ext = enrich_external_trigger_for_company(comp)
-            # product category: union of primary topics across company
+            beh = ", ".join(sorted(set(cg.get("Behavioral_Trigger", pd.Series(dtype=object)).dropna().astype(str).tolist())))
+            ext = ""
+            try:
+                ext = enrich_external_trigger_for_company(display_name)
+            except Exception:
+                ext = ""
             pcs = []
-            for p in cg["Primary_Topic"].dropna().astype(str):
+            for p in cg.get("Primary_Topic", pd.Series(dtype=object)).dropna().astype(str):
                 for tok in p.split(","):
                     t = tok.strip()
                     if t and t not in pcs:
                         pcs.append(t)
             prod_cat = ",".join(pcs)
             comp_rows.append({
-                "Company": comp,
+                "Reader Org": display_name,
                 "Active_Individuals": active_inds,
                 "Dominant_Topic": dom,
                 "Team_Buying_Signal": team_signal,
@@ -593,9 +634,16 @@ def excel_with_styles(dfs: dict, filename: str = "report.xlsx") -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet, df in dfs.items():
+            # Ensure company sheets use 'Reader Org' as the display column when possible
+            df_to_write = df.copy()
+            if sheet in ("Company_Combined", "Company_Summary"):
+                # If DataFrame has 'Company' but not 'Reader Org', rename it for clarity
+                if "Reader Org" not in df_to_write.columns and "Company" in df_to_write.columns:
+                    df_to_write = df_to_write.rename(columns={"Company": "Reader Org"})
+                # If neither present but a 'Reader_Org_Norm' exists, leave as-is
             # sanitize sheet name
             sheet_name = sheet[:31]
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            df_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
 
     output.seek(0)
     wb = load_workbook(output)
@@ -765,8 +813,23 @@ def main():
 
         individuals_df = pd.DataFrame.from_records(indiv_records)
 
-        # Company aggregation: distinct user id counts
-        comp_agg = individuals_df.groupby("Reader Company").agg(Company_Contact_Count=("User ID", lambda s: s.nunique())).reset_index()
+        # Build company aggregation using normalized Reader Org (distinct user id counts)
+        inds_for_agg = individuals_df.copy()
+        if "Reader Org" in inds_for_agg.columns:
+            inds_for_agg["Reader_Org_Raw"] = inds_for_agg["Reader Org"].astype(str).fillna("").str.strip()
+        else:
+            inds_for_agg["Reader_Org_Raw"] = inds_for_agg.get("Reader Company", "").astype(str).fillna("").str.strip()
+        inds_for_agg["Reader_Org_Norm"] = inds_for_agg["Reader_Org_Raw"].apply(normalize_org_key)
+
+        comp_agg_rows = []
+        for norm_key, cg in inds_for_agg.groupby("Reader_Org_Norm"):
+            try:
+                modes = cg["Reader_Org_Raw"].mode()
+                display_name = modes.iloc[0] if not modes.empty else (cg["Reader_Org_Raw"].dropna().astype(str).iloc[0] if not cg["Reader_Org_Raw"].dropna().empty else "")
+            except Exception:
+                display_name = cg["Reader_Org_Raw"].astype(str).iloc[0] if not cg["Reader_Org_Raw"].empty else ""
+            comp_agg_rows.append({"Reader Org": display_name, "Reader_Org_Norm": norm_key, "Company_Contact_Count": int(cg["User ID"].nunique())})
+        comp_agg = pd.DataFrame.from_records(comp_agg_rows)
 
         # Apply intent scoring
         try:
@@ -776,15 +839,28 @@ def main():
             return
 
         # Build a company-level summary that includes team buying (Yes/No),
-        # max intent, count of high-intent contacts, and best external trigger
+        # max intent, count of high-intent contacts, and best external trigger —
+        # grouped by normalized Reader Org (displaying the most common original name).
         inds = individuals_scored.copy()
-        # ensure Intent_Score available (if scoring used Intent_Base only, fall back)
         if "Intent_Score" not in inds.columns and "Intent_Base_Score" in inds.columns:
             inds["Intent_Score"] = inds["Intent_Base_Score"].fillna(0).astype(int)
 
+        # ensure Reader Org raw/norm present on scored frame
+        if "Reader Org" in inds.columns:
+            inds["Reader_Org_Raw"] = inds["Reader Org"].astype(str).fillna("").str.strip()
+        else:
+            inds["Reader_Org_Raw"] = inds.get("Reader Company", "").astype(str).fillna("").str.strip()
+        inds["Reader_Org_Norm"] = inds["Reader_Org_Raw"].apply(normalize_org_key)
+
         comp_rows = []
-        comp_grp = inds.groupby("Reader Company") if not inds.empty else []
-        for comp, cg in comp_grp:
+        comp_grp = inds.groupby("Reader_Org_Norm") if not inds.empty else []
+        for norm_key, cg in comp_grp:
+            try:
+                modes = cg["Reader_Org_Raw"].mode()
+                display_name = modes.iloc[0] if not modes.empty else (cg["Reader_Org_Raw"].dropna().astype(str).iloc[0] if not cg["Reader_Org_Raw"].dropna().empty else "")
+            except Exception:
+                display_name = cg["Reader_Org_Raw"].astype(str).iloc[0] if not cg["Reader_Org_Raw"].empty else ""
+
             contact_count = int(cg["User ID"].nunique()) if "User ID" in cg.columns else int(cg.shape[0])
             max_intent = int(cg["Intent_Score"].fillna(0).astype(int).max()) if "Intent_Score" in cg.columns else 0
             num_high = int((cg.get("Intent_Score", 0) >= 60).sum()) if "Intent_Score" in cg.columns else 0
@@ -793,7 +869,6 @@ def main():
             ext_title = ""
             ext_url = ""
             ext_type = ""
-            # prefer an external trigger present on any contact
             if "External_Trigger_Title" in cg.columns:
                 nonempty = cg[cg["External_Trigger_Title"].astype(str).str.strip() != ""]
                 if not nonempty.empty:
@@ -805,7 +880,7 @@ def main():
             # If company is high-intent by max score but no individual trigger found, fetch company-level trigger
             if max_intent >= 60 and not ext_url:
                 try:
-                    best = find_best_trigger_for_company(comp)
+                    best = find_best_trigger_for_company(display_name)
                     if best:
                         ext_title = best.get("external_trigger_title", "")
                         ext_url = best.get("external_trigger_url", "")
@@ -817,7 +892,7 @@ def main():
             high_intent_flag = "Yes" if (max_intent >= 60 or num_high >= 1) else "No"
 
             comp_rows.append({
-                "Company": comp,
+                "Reader Org": display_name,
                 "Company_Contact_Count": contact_count,
                 "Team_Buying": team_buying,
                 "Max_Intent_Score": max_intent,
@@ -839,7 +914,7 @@ def main():
 
         results = {
             "individuals": individuals_scored.rename(columns={"Total_Engagements": "Total Engagements"}),
-            "company_combined": comp_agg.rename(columns={"Reader Company": "Company"}),
+            "company_combined": comp_agg,  # already contains 'Reader Org' & counts
             "company_summary": company_summary,
             "product_map": pd.DataFrame(),
             "sales_hot_list": sales_hot,
@@ -1006,32 +1081,94 @@ def main():
         inds_filtered = inds_all
 
     # UI: simplified view toggle and highlighted indicators
+    # provide a compact/simple view toggle in the sidebar
+    try:
+        simple_view = st.sidebar.checkbox("Simple view (compact)", value=True, key="simple_view")
+    except Exception:
+        simple_view = True
     st.subheader("Individuals (filtered)")
-    simple_view = st.sidebar.checkbox("Simplified view (show key columns)", value=True)
+    # Field definitions / tooltips: provide an expandable reference for non-obvious fields
+    with st.expander("Field definitions (click to expand)"):
+        st.markdown("""
+        - **Intent_Score:** A combined score (0–100) based on engagement frequency, recency, non-NL weight, buyer journey behavior, vendor evaluation depth, and external triggers.
+        - **Confidence_Score:** A metric indicating how reliable the intent score is, based on activity recency, non-NL engagement weight, and the availability of external triggers.
+        - **Derived_Buyer_Journey_Label:** The inferred stage of the buyer: Awareness → Solution Exploration → Problem Definition → Vendor Evaluation → Active Purchase.
+        - **Vendor_Intensity_Flags / Buyer_Intensity_Flags:** Signals based on non-NL engagement, depth of comparison activity, and repeat visits to product-specific content.
+        - **External_Trigger_Type:** Press-driven indicators such as funding, expansion, new hires, or major partnerships.
+        """)
+        # second expander: exact formulas and weights
+        with st.expander("Formulas & Weights (click to expand)"):
+            st.markdown("""
+            **Intent_Score (how it's computed)**
+            - Compute intermediate components:
+              - `recency_score`: 3 (<=30 days), 2 (<=90d), 1 (<=180d), 0 (older/unknown)
+              - `engagement_score`: `Total_Engagements` (capped at 30) + `Non_NL_Engagements`
+              - `buyer_journey_base`: mapping {Awareness:5, Solution Exploration:10, Problem Definition:15, Vendor Evaluation:20}
+              - `team_buying_score`: 5 if company contacts >=3, 3 if ==2, else 0
+              - `vendor_eval_score`: 5 if vendors evaluated >=5, 3 if 2-4, else 0
+            - `raw_base_score` = engagement_score + recency_score + buyer_journey_base + team_buying_score + vendor_eval_score
+            - `Intent_Base_Score` = linear scale of `raw_base_score` to 0-100 across the dataset (min→0, max→100)
+            - `Intent_Score` = `Intent_Base_Score` + `External_Trigger_Score` (capped at 100)
 
-    # create a visible 'Priority' indicator column based on Intent_Score
-    disp = inds_filtered.copy()
-    def priority_emoji(row):
-        s = row.get("Intent_Score") if row is not None else None
-        try:
-            s = int(s)
-        except Exception:
-            s = None
-        if s is None:
+            **Confidence_Score (how it's computed)**
+            - Start at 0; add:
+              - +30 if last activity <= 90 days
+              - +30 if `Non_NL_Engagements` >= 3
+                                    - +40 if `External_Trigger_Score` > 0
+                                - Final: clipped to 0-100
+
+                                **Derived_Buyer_Journey_Label (thresholds & hybrid rule)**
+                                - Derived from `Intent_Score`:
+                                    - >=81 → High-Priority Hot Lead
+                                    - 61–80 → Vendor Evaluation
+                                    - 41–60 → Solution Exploration
+                                    - 21–40 → Problem Definition
+                                    - 0–20 → Awareness
+                                - Hybrid escalation rule: if `Intent_Score` < 61 but (`Non_NL_Engagements` >= 3 OR `Vendors_Evaluated` count >= 2), promote to `Vendor Evaluation`.
+
+                                **Vendor_Intensity_Flags / Buyer_Intensity_Flags (heuristics)**
+                                - Flags set by `detect_behavioral_triggers_and_flags` using:
+                                    - explicit `activity_source` non-newsletter markers → mark Non-NL engagement
+                                    - late-stage keywords in content (compare/pricing/quote/RFP/vendor/evaluation) → Late-stage content flag
+                                    - process keywords (upstream/downstream/scale-up/tech transfer/viral clearance/etc.) counted >=2 → Deep process interest
+
+                                **External_Trigger_Type (how it's inferred)**
+                                - Articles fetched via NewsAPI or Google News RSS are classified by keyword rules into types like `funding`, `expansion`, `hires`, `partnership`, or `press` and assigned an `External_Trigger_Score` which is added to `Intent_Score`.
+
+                                """)
+        def priority_emoji(row):
+            s = row.get("Intent_Score") if row is not None else None
+            try:
+                s = int(s)
+            except Exception:
+                s = None
+            if s is None:
+                return ""
+            if s >= 85:
+                return "🔥🔥"
+            if s >= 70:
+                return "🔥"
+            if s >= 50:
+                return "⚡"
             return ""
-        if s >= 85:
-            return "🔥🔥"
-        if s >= 70:
-            return "🔥"
-        if s >= 50:
-            return "⚡"
-        return ""
+
+    # prepare display frame from filtered individuals
+    try:
+        disp = inds_filtered.copy()
+    except Exception:
+        disp = pd.DataFrame()
 
     if not disp.empty:
         disp["Priority"] = disp.apply(priority_emoji, axis=1)
 
     if simple_view:
-        show_cols = [c for c in ["Priority", "User ID", "Reader Company", "Title", "Total Engagements", label_col, "Primary_Topic", "Potential_Vendors", "Vendors_Evaluated", "External_Trigger_Title", "External_Trigger_URL", "Intent_Score", "Intent_Label", "Confidence_Score"] if c in disp.columns]
+        # prefer display of Reader Org if present
+        preferred_org_col = "Reader Org" if "Reader Org" in disp.columns else "Reader Company"
+        cols_base = ["Priority", "User ID", preferred_org_col, "Title", "Total Engagements"]
+        # include the chosen label column (derived) or the display alias
+        label_display = "Derived_Buyer_Journey_Label" if "Derived_Buyer_Journey_Label" in disp.columns else label_col
+        cols_rest = [label_display, "Primary_Topic", "Potential_Vendors", "Vendors_Evaluated", "External_Trigger_Title", "External_Trigger_URL", "Intent_Score", "Intent_Label", "Confidence_Score"]
+        show_cols = [c for c in (cols_base + cols_rest) if c in disp.columns]
         disp_show = disp[show_cols].copy()
         st.dataframe(disp_show.head(200))
         with st.expander("Advanced: show all columns"):
@@ -1044,9 +1181,11 @@ def main():
     try:
         comp_sum = results.get("company_summary")
         if comp_sum is not None and not comp_sum.empty:
+            # prefer 'Reader Org' for display if present
+            display_col = "Reader Org" if "Reader Org" in comp_sum.columns else ("Company" if "Company" in comp_sum.columns else comp_sum.columns[0])
             top_comp = comp_sum.sort_values(by=["Max_Intent_Score"], ascending=False).head(10)
             for _, r in top_comp.iterrows():
-                title = r.get("Company", "")
+                title = r.get(display_col, "")
                 score = r.get("Max_Intent_Score", "")
                 ext_title = r.get("External_Trigger_Title", "")
                 ext_url = r.get("External_Trigger_URL", "")
