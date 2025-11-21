@@ -1161,6 +1161,8 @@ def main():
     if not disp.empty:
         disp["Priority"] = disp.apply(priority_emoji, axis=1)
 
+    if 'simple_view' not in locals():
+        simple_view = True
     if simple_view:
         # prefer display of Reader Org if present
         preferred_org_col = "Reader Org" if "Reader Org" in disp.columns else "Reader Company"
