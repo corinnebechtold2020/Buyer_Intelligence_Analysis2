@@ -385,7 +385,7 @@ def stage_from_text(text: str):
 
 
 @st.cache_data
-def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
+def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: bool = True):
     """Process normalized DataFrame into v5-style Individuals, Company_Combined and Sales_Hot_List.
 
     This function recreates the transformation, explanation, primary topic extraction,
@@ -541,9 +541,15 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
             inds_tmp["Reader_Org_Raw"] = inds_tmp.get("Reader Company", "").astype(str).fillna("").str.strip()
 
         inds_tmp["Reader_Org_Norm"] = inds_tmp["Reader_Org_Raw"].apply(normalize_org_key)
+        # optionally derive a base key (first token) to combine subsidiaries/variants
+        if rollup_base:
+            inds_tmp["Reader_Org_Base"] = inds_tmp["Reader_Org_Norm"].apply(lambda x: str(x).split()[0] if str(x).strip() else "")
+            group_key = "Reader_Org_Base"
+        else:
+            group_key = "Reader_Org_Norm"
 
         comp_rows = []
-        for norm_key, cg in inds_tmp.groupby("Reader_Org_Norm"):
+        for base_key, cg in inds_tmp.groupby(group_key):
             # display name: most common original Reader Org text in this normalized group
             display_name = ""
             try:
@@ -555,6 +561,7 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5):
             except Exception:
                 display_name = cg["Reader_Org_Raw"].astype(str).iloc[0] if not cg["Reader_Org_Raw"].empty else ""
 
+            # active individuals in the base group (count of rows / individuals)
             active_inds = cg.shape[0]
             dom = cg["Primary_Topic"].value_counts().idxmax() if cg["Primary_Topic"].notna().any() else ""
             team_signal = "Yes" if active_inds >= 2 else "No"
@@ -710,6 +717,8 @@ def main():
 
     min_eng = st.sidebar.number_input("Minimum engagements per individual (filter)", value=5, min_value=1, step=1)
     enrich = st.sidebar.checkbox("Enrich high-intent companies (stub)", value=False)
+    # UI option: whether to roll up company variants by their base normalized token
+    rollup_base = st.sidebar.checkbox("Roll up company variants by base name (e.g. 'Abbott')", value=True)
 
     if uploaded is None:
         st.info("Upload a .xlsx or .csv file to begin. You can also open the sample below.")
@@ -820,15 +829,21 @@ def main():
         else:
             inds_for_agg["Reader_Org_Raw"] = inds_for_agg.get("Reader Company", "").astype(str).fillna("").str.strip()
         inds_for_agg["Reader_Org_Norm"] = inds_for_agg["Reader_Org_Raw"].apply(normalize_org_key)
+        # choose grouping key: base token roll-up or full normalized org
+        if rollup_base:
+            inds_for_agg["Reader_Org_Base"] = inds_for_agg["Reader_Org_Norm"].apply(lambda x: str(x).split()[0] if str(x).strip() else "")
+            agg_group_key = "Reader_Org_Base"
+        else:
+            agg_group_key = "Reader_Org_Norm"
 
         comp_agg_rows = []
-        for norm_key, cg in inds_for_agg.groupby("Reader_Org_Norm"):
+        for base_key, cg in inds_for_agg.groupby(agg_group_key):
             try:
                 modes = cg["Reader_Org_Raw"].mode()
                 display_name = modes.iloc[0] if not modes.empty else (cg["Reader_Org_Raw"].dropna().astype(str).iloc[0] if not cg["Reader_Org_Raw"].dropna().empty else "")
             except Exception:
                 display_name = cg["Reader_Org_Raw"].astype(str).iloc[0] if not cg["Reader_Org_Raw"].empty else ""
-            comp_agg_rows.append({"Reader Org": display_name, "Reader_Org_Norm": norm_key, "Company_Contact_Count": int(cg["User ID"].nunique())})
+            comp_agg_rows.append({"Reader Org": display_name, "Company_Contact_Count": int(cg["User ID"].nunique())})
         comp_agg = pd.DataFrame.from_records(comp_agg_rows)
 
         # Apply intent scoring
@@ -851,10 +866,14 @@ def main():
         else:
             inds["Reader_Org_Raw"] = inds.get("Reader Company", "").astype(str).fillna("").str.strip()
         inds["Reader_Org_Norm"] = inds["Reader_Org_Raw"].apply(normalize_org_key)
+        if rollup_base:
+            inds["Reader_Org_Base"] = inds["Reader_Org_Norm"].apply(lambda x: str(x).split()[0] if str(x).strip() else "")
+            comp_grp = inds.groupby("Reader_Org_Base") if not inds.empty else []
+        else:
+            comp_grp = inds.groupby("Reader_Org_Norm") if not inds.empty else []
 
         comp_rows = []
-        comp_grp = inds.groupby("Reader_Org_Norm") if not inds.empty else []
-        for norm_key, cg in comp_grp:
+        for base_key, cg in comp_grp:
             try:
                 modes = cg["Reader_Org_Raw"].mode()
                 display_name = modes.iloc[0] if not modes.empty else (cg["Reader_Org_Raw"].dropna().astype(str).iloc[0] if not cg["Reader_Org_Raw"].dropna().empty else "")
@@ -952,7 +971,7 @@ def main():
     # Process (legacy pipeline if not using User ID)
     if "user id" not in cols_lc:
         with st.spinner("Processing data — this may take a moment for tens of thousands of rows..."):
-            results = process_dataframe(df, min_engagements=min_eng)
+            results = process_dataframe(df, min_engagements=min_eng, rollup_base=rollup_base)
 
     st.success("Processing complete")
 
