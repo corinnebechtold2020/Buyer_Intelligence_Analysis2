@@ -9,7 +9,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from utils import normalize_activities_df
-from vendors import get_potential_vendors_for_topics
+from vendors import get_potential_vendors_for_topics, get_all_vendors
 from scoring import apply_intent_scoring
 from external_triggers import find_best_trigger_for_company
 from filters import (
@@ -1157,7 +1157,34 @@ def main():
         for ttype in selected_trigger_types:
             trigger_mask |= inds_base["External_Trigger_Type"].astype(str).str.contains(ttype, case=False, na=False)
         inds_base = inds_base[trigger_mask].copy()
-    st.sidebar.markdown(f"**After trigger filter:** {len(inds_base):,} individuals")
+        st.sidebar.markdown(f"**After trigger filter:** {len(inds_base):,} individuals")
+
+    # Vendor Fit filter
+    all_vendors = get_all_vendors()
+    vendor_fit_selection = st.sidebar.multiselect(
+        "Vendor Fit (Potential Solution Vendors)",
+        options=all_vendors,
+        default=[],
+        help="Filter to individuals/companies where the selected vendors would likely be a good solution based on their topics/product interests.",
+        key="vendor_fit"
+    )
+
+    # Apply vendor fit filter
+    if vendor_fit_selection:
+        def row_matches_vendor_fit(row):
+            vendors = set()
+            for col in ["Potential_Vendors", "Vendors_Evaluated"]:
+                if col in row and pd.notna(row[col]):
+                    val_str = str(row[col])
+                    parts = [p.strip() for p in val_str.split(",") if p.strip()]
+                    vendors.update(parts)
+            # Case-insensitive match
+            selected_lower = {v.lower() for v in vendor_fit_selection}
+            row_lower = {v.lower() for v in vendors}
+            return bool(selected_lower & row_lower)
+        
+        inds_base = inds_base[inds_base.apply(row_matches_vendor_fit, axis=1)].copy()
+        st.sidebar.markdown(f"**After vendor fit filter:** {len(inds_base):,} individuals")
 
     label_col = "Buyer_Journey_Label"
 
@@ -1190,6 +1217,7 @@ def main():
             st.session_state["lifecycle_stage"] = []
             st.session_state["topic_filter"] = []
             st.session_state["trigger_type_filter"] = []
+            st.session_state["vendor_fit"] = []
 
         # Apply filters to a display copy
         filt = pd.Series(True, index=inds_base.index)
