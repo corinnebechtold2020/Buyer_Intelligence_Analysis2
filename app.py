@@ -12,6 +12,12 @@ from utils import normalize_activities_df
 from vendors import get_potential_vendors_for_topics
 from scoring import apply_intent_scoring
 from external_triggers import find_best_trigger_for_company
+from filters import (
+    LIFECYCLE_CATEGORIES,
+    LIFECYCLE_TO_TOPICS,
+    get_topics_for_lifecycle,
+    apply_lifecycle_topic_filters,
+)
 
 # ------------------------
 # LSC Buyer Journey Intelligence Engine
@@ -62,6 +68,27 @@ def extract_primary_topic(row):
         freq[p] = freq.get(p, 0) + 1
     top = sorted(freq.items(), key=lambda x: (-x[1], x[0]))[:3]
     return ",".join([t[0] for t in top])
+
+
+def deduplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicate column names by keeping the first occurrence."""
+    if df.empty:
+        return df
+    # Check for duplicates
+    if len(df.columns) == len(set(df.columns)):
+        return df  # No duplicates
+    
+    # Use iloc to select columns by position, avoiding issues with duplicate names
+    seen = set()
+    keep_indices = []
+    for i, col in enumerate(df.columns):
+        if col not in seen:
+            keep_indices.append(i)
+            seen.add(col)
+    
+    # Select only the unique columns by index
+    result = df.iloc[:, keep_indices].copy()
+    return result
 
 
 def normalize_org_key(name: str) -> str:
@@ -502,6 +529,8 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: b
         })
 
     individuals_df = pd.DataFrame.from_records(records)
+    # Remove duplicate columns if any
+    individuals_df = deduplicate_columns(individuals_df)
 
     # ensure numeric
     if "Total Engagements" in individuals_df.columns:
@@ -513,15 +542,24 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: b
     # create a scoring-friendly column name
     if "Total Engagements" in indiv_for_scoring.columns and "Total_Engagements" not in indiv_for_scoring.columns:
         indiv_for_scoring["Total_Engagements"] = indiv_for_scoring["Total Engagements"].astype(int)
-    # company aggregation for team buying
+    # Prefer `Reader Org` for grouping/scoring when available (fallback to `Reader Company`)
+    if "Reader Org" in indiv_for_scoring.columns:
+        # create a scoring-friendly `Reader Company` column that prefers Reader Org when present
+        ro = indiv_for_scoring["Reader Org"].astype(str).fillna("").str.strip()
+        rc = indiv_for_scoring.get("Reader Company", pd.Series([""] * len(indiv_for_scoring))).astype(str).fillna("").str.strip()
+        indiv_for_scoring["Reader Company"] = ro.where(ro != "", rc)
+
+    # company aggregation for team buying (now using the adjusted `Reader Company` column)
     comp_agg = indiv_for_scoring.groupby("Reader Company").agg(Company_Contact_Count=("Reader Company", "count")).reset_index()
     # attempt to compute intent scoring and derived buyer journey; fall back gracefully on error
     try:
-        scored = apply_intent_scoring(indiv_for_scoring, comp_agg)
+        scored = apply_intent_scoring(indiv_for_scoring, comp_agg, org_column="Reader Org")
         # ensure we keep the original display naming
         if "Total_Engagements" in scored.columns and "Total Engagements" not in scored.columns:
             scored["Total Engagements"] = scored["Total_Engagements"].astype(int)
         individuals_df = scored
+        # Remove duplicate columns from scored dataframe
+        individuals_df = deduplicate_columns(individuals_df)
     except Exception:
         # scoring failed — ensure Derived_Buyer_Journey exists as a fallback copy
         if "Derived_Buyer_Journey" not in individuals_df.columns:
@@ -529,6 +567,8 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: b
 
     # filter by min engagements
     individuals_filtered = individuals_df[individuals_df["Total Engagements"] >= int(min_engagements)].copy()
+    # Remove duplicate columns from individuals_filtered
+    individuals_filtered = deduplicate_columns(individuals_filtered)
     # Company combined (group by normalized Reader Org)
     if individuals_filtered.empty:
         company_combined = pd.DataFrame(columns=["Reader Org", "Active_Individuals", "Dominant_Topic", "Team_Buying_Signal", "Behavioral_Triggers", "External_Trigger", "Product_Category"])
@@ -568,7 +608,11 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: b
             beh = ", ".join(sorted(set(cg.get("Behavioral_Trigger", pd.Series(dtype=object)).dropna().astype(str).tolist())))
             ext = ""
             try:
-                ext = enrich_external_trigger_for_company(display_name)
+                best = find_best_trigger_for_company(display_name)
+                if best:
+                    ext = best.get("external_trigger_title", "")
+                else:
+                    ext = ""
             except Exception:
                 ext = ""
             pcs = []
@@ -589,15 +633,53 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: b
             })
         company_combined = pd.DataFrame.from_records(comp_rows)
 
-    # Sales hot list: individuals in Vendor Evaluation
-    sales_hot = individuals_filtered[individuals_filtered["Buyer_Journey_Label"] == "Vendor Evaluation"].copy()
+    # Sales hot list: prioritize high-intent / evaluation contacts
+    base_hot = individuals_filtered.copy()
+    if base_hot.empty:
+        # fall back to all individuals if the min_engagements filter removed everything
+        try:
+            base_hot = deduplicate_columns(individuals_df.copy())
+        except Exception:
+            base_hot = individuals_df.copy()
+    sales_hot = base_hot.copy()
+    score_col = None
+    if "Intent_Score" in sales_hot.columns:
+        score_col = "Intent_Score"
+    elif "Intent_Base_Score" in sales_hot.columns:
+        score_col = "Intent_Base_Score"
+
+    # Primary filter: score >= 70 when available
+    if score_col:
+        sales_hot = sales_hot[sales_hot[score_col].fillna(0).astype(int) >= 70]
+
+    # Fallbacks if empty
+    if sales_hot.empty:
+        # Use derived/vendor evaluation stage if present
+        if "Buyer_Journey_Label" in individuals_filtered.columns:
+            sales_hot = individuals_filtered[individuals_filtered["Buyer_Journey_Label"] == "Vendor Evaluation"].copy()
+        if sales_hot.empty and "Derived_Buyer_Journey" in individuals_filtered.columns:
+            sales_hot = individuals_filtered[individuals_filtered["Derived_Buyer_Journey"] == "Vendor Evaluation"].copy()
+
+    # Ultimate fallbacks if still empty
+    if sales_hot.empty:
+        source_df = base_hot if not base_hot.empty else individuals_filtered
+        if score_col and score_col in source_df.columns:
+            sales_hot = source_df.sort_values(score_col, ascending=False).head(50)
+        elif "Total Engagements" in source_df.columns:
+            sales_hot = source_df.sort_values("Total Engagements", ascending=False).head(50)
+        else:
+            sales_hot = source_df.head(50)
     if not sales_hot.empty:
+        # Remove duplicate columns first
+        sales_hot = deduplicate_columns(sales_hot)
         # adapt column names to expected Sales_Hot_List names
         sales_hot = sales_hot.rename(columns={
             "Total Engagements": "Total_Engagements",
             "Buyer_Journey_Label": "Buyer_Journey_Label",
             "Reason to Reach out": "Reason_to_Reach_Out",
         })
+        # Deduplicate again after rename in case it created duplicates
+        sales_hot = deduplicate_columns(sales_hot)
         # ensure column order matches v5 preview
         cols = [
             "Reader Company",
@@ -618,13 +700,20 @@ def process_dataframe(df: pd.DataFrame, min_engagements: int = 5, rollup_base: b
         for c in cols:
             if c not in sales_hot.columns:
                 sales_hot[c] = ""
-        sales_hot = sales_hot[cols]
+        # Select only columns that actually exist and are unique
+        existing_cols = [c for c in cols if c in sales_hot.columns]
+        sales_hot = sales_hot[existing_cols].copy()
+        # Final deduplication before returning
+        sales_hot = deduplicate_columns(sales_hot)
 
     # product_map: reuse earlier approach but simpler
     product_map = pd.DataFrame(columns=["product", "mentions", "unique_companies"]) if df.empty else df.groupby("product").agg(mentions=("product", "count"), unique_companies=("reader_company", lambda s: s.dropna().nunique())).reset_index().sort_values(by="mentions", ascending=False)
 
     # company_summary mirrors company_combined plus additional columns
     company_summary = company_combined.copy()
+    
+    # Ensure all returned dataframes are deduplicated
+    individuals_filtered = deduplicate_columns(individuals_filtered)
 
     return {
         "individuals": individuals_filtered,
@@ -821,6 +910,8 @@ def main():
             })
 
         individuals_df = pd.DataFrame.from_records(indiv_records)
+        # Remove duplicate columns if any
+        individuals_df = deduplicate_columns(individuals_df)
 
         # Build company aggregation using normalized Reader Org (distinct user id counts)
         inds_for_agg = individuals_df.copy()
@@ -843,12 +934,16 @@ def main():
                 display_name = modes.iloc[0] if not modes.empty else (cg["Reader_Org_Raw"].dropna().astype(str).iloc[0] if not cg["Reader_Org_Raw"].dropna().empty else "")
             except Exception:
                 display_name = cg["Reader_Org_Raw"].astype(str).iloc[0] if not cg["Reader_Org_Raw"].empty else ""
-            comp_agg_rows.append({"Reader Org": display_name, "Company_Contact_Count": int(cg["User ID"].nunique())})
+            # include a `Reader Company` column so downstream scoring (which expects
+            # `Reader Company`) will use the Reader Org display name when available
+            comp_agg_rows.append({"Reader Org": display_name, "Reader Company": display_name, "Company_Contact_Count": int(cg["User ID"].nunique())})
         comp_agg = pd.DataFrame.from_records(comp_agg_rows)
 
         # Apply intent scoring
         try:
-            individuals_scored = apply_intent_scoring(individuals_df.rename(columns={"Total_Engagements": "Total_Engagements"}), comp_agg)
+            individuals_scored = apply_intent_scoring(individuals_df.rename(columns={"Total_Engagements": "Total_Engagements"}), comp_agg, org_column="Reader Org")
+            # Remove duplicate columns from scored frame
+            individuals_scored = deduplicate_columns(individuals_scored)
         except Exception as e:
             st.error(f"Failed to compute intent scoring: {e}")
             return
@@ -931,8 +1026,15 @@ def main():
             # no intent score available, produce empty sales hot list
             sales_hot = individuals_scored.iloc[0:0].copy()
 
+        # Rename back to display name and ensure no duplicates
+        result_inds = individuals_scored.copy()
+        if "Total_Engagements" in result_inds.columns:
+            result_inds = result_inds.drop(columns=["Total Engagements"], errors="ignore")  # Remove old name if exists
+            result_inds = result_inds.rename(columns={"Total_Engagements": "Total Engagements"})
+        result_inds = deduplicate_columns(result_inds)
+
         results = {
-            "individuals": individuals_scored.rename(columns={"Total_Engagements": "Total Engagements"}),
+            "individuals": result_inds,
             "company_combined": comp_agg,  # already contains 'Reader Org' & counts
             "company_summary": company_summary,
             "product_map": pd.DataFrame(),
@@ -983,66 +1085,94 @@ def main():
 
     # Sidebar controls
     st.sidebar.markdown("**Display filters (UI only)**")
-    # Product / topic filter (broadened)
-    # gather tokens from Primary_Topic, Content Topics, Product column, and vendor product categories
-    topic_tokens = set()
+    lifecycle_selection = st.sidebar.multiselect(
+        "Drug Development Lifecycle Stage",
+        options=list(LIFECYCLE_CATEGORIES.keys()),
+        format_func=lambda k: LIFECYCLE_CATEGORIES[k],
+        help="Filter by where the company is in the drug development and manufacturing lifecycle.",
+        key="lifecycle_stage",
+    )
+
+    # Product / topic options - stage-aware and pruned to topics present in data
+    existing_topics = set()
     if not inds_all.empty:
-        # Primary_Topic / Primary Topic
-        if "Primary_Topic" in inds_all.columns:
-            for s in inds_all["Primary_Topic"].dropna().astype(str):
-                for t in str(s).split(","):
-                    tt = t.strip()
-                    if tt:
-                        topic_tokens.add(tt)
-        if "Primary Topic" in inds_all.columns:
-            for s in inds_all["Primary Topic"].dropna().astype(str):
-                for t in str(s).split(","):
-                    tt = t.strip()
-                    if tt:
-                        topic_tokens.add(tt)
+        for col in ["Primary_Topic", "Primary Topic", "Product_Category"]:
+            if col in inds_all.columns:
+                series_vals = inds_all[col].dropna().astype(str)
+                for s in series_vals:
+                    for t in str(s).split(","):
+                        tt = t.strip()
+                        if tt:
+                            existing_topics.add(tt)
 
-        # Content Topics column (may be comma-separated)
-        if "Content Topics" in inds_all.columns:
-            for s in inds_all["Content Topics"].dropna().astype(str):
-                for t in str(s).split(","):
-                    tt = t.strip()
-                    if tt:
-                        topic_tokens.add(tt)
+    topic_options = get_topics_for_lifecycle(lifecycle_selection, existing_topics=sorted(existing_topics))
+    selected_topics = st.sidebar.multiselect(
+        "Products / Topics of Interest",
+        options=topic_options,
+        default=[],
+        help="Filter by specific products, technologies, or topics.",
+        key="topic_filter",
+    )
 
-        # Product / product column
-        for prod_col in ("Product", "product"):
-            if prod_col in inds_all.columns:
-                for s in inds_all[prod_col].dropna().astype(str):
-                    tt = str(s).strip()
-                    if tt:
-                        topic_tokens.add(tt)
+    # External trigger type filter
+    trigger_type_options = ["funding", "expansion", "hires", "partnership", "press", "merger", "regulatory"]
+    selected_trigger_types = st.sidebar.multiselect(
+        "External Trigger Types",
+        options=trigger_type_options,
+        default=[],
+        help="Filter by type of external news/events (funding, expansion, hires, etc.).",
+        key="trigger_type_filter",
+    )
 
-    # include keys from PRODUCT_VENDOR_MAP to help users choose broad categories
-    try:
-        from vendors import PRODUCT_VENDOR_MAP
-        for k in PRODUCT_VENDOR_MAP.keys():
-            topic_tokens.add(k)
-            # also add shorter tokens from the key
-            for tok in k.split():
-                if len(tok) > 3:
-                    topic_tokens.add(tok)
-    except Exception:
-        pass
+    # Determine which column to use for topics
+    topic_column = None
+    for col in ["Primary_Topic", "Primary Topic", "Product_Category"]:
+        if col in inds_all.columns:
+            topic_column = col
+            break
 
-    topic_options = sorted(topic_tokens)
-    selected_topics = st.sidebar.multiselect("Product / Topic filter", options=topic_options, default=[], key="topic_filter")
-    if not inds_all.empty:
+    # Debug: show which column is being used
+    if lifecycle_selection or selected_topics:
+        st.sidebar.caption(f"Using column: {topic_column if topic_column else 'None found'}")
+
+    # Apply lifecycle/topic filters first
+    if topic_column:
+        inds_base = apply_lifecycle_topic_filters(
+            inds_all,
+            lifecycle_column=topic_column,
+            topic_column=topic_column,
+            selected_lifecycles=lifecycle_selection,
+            selected_topics=selected_topics,
+        )
+    else:
+        inds_base = inds_all.copy()
+    # Show filter counts for debugging
+    if lifecycle_selection or selected_topics:
+        st.sidebar.markdown(f"**Lifecycle/Topic filtered:** {len(inds_base):,} of {len(inds_all):,} individuals")
+
+
+    # Apply external trigger type filter
+    if selected_trigger_types and "External_Trigger_Type" in inds_base.columns:
+        trigger_mask = pd.Series(False, index=inds_base.index)
+        for ttype in selected_trigger_types:
+            trigger_mask |= inds_base["External_Trigger_Type"].astype(str).str.contains(ttype, case=False, na=False)
+        inds_base = inds_base[trigger_mask].copy()
+    st.sidebar.markdown(f"**After trigger filter:** {len(inds_base):,} individuals")
+
+    label_col = "Buyer_Journey_Label"
+
+    if not inds_base.empty:
         # Gather potential vendors and evaluated vendors as option lists
-        pv_series = inds_all.get("Potential_Vendors", pd.Series(dtype=object)).dropna().astype(str)
+        pv_series = inds_base.get("Potential_Vendors", pd.Series(dtype=object)).dropna().astype(str)
         pv_options = sorted({v.strip() for s in pv_series for v in s.split(",") if v.strip()})
-        ev_series = inds_all.get("Vendors_Evaluated", pd.Series(dtype=object)).dropna().astype(str)
+        ev_series = inds_base.get("Vendors_Evaluated", pd.Series(dtype=object)).dropna().astype(str)
         ev_options = sorted({v.strip() for s in ev_series for v in s.split(",") if v.strip()})
 
         # Use session_state keys so we can reset the widgets programmatically
         selected_pv = st.sidebar.multiselect("Potential Vendors", options=pv_options, default=[], key="pv")
         selected_ev = st.sidebar.multiselect("Vendors Evaluated", options=ev_options, default=[], key="ev")
 
-        max_eng = int(inds_all["Total Engagements"].max()) if "Total Engagements" in inds_all.columns and not inds_all["Total Engagements"].isnull().all() else 20
+        max_eng = int(inds_base["Total Engagements"].max()) if "Total Engagements" in inds_base.columns and not inds_base["Total Engagements"].isnull().all() else 20
         min_eng_display = st.sidebar.slider("Min engagements to display", 1, max(1, max_eng), value=int(min_eng), key="min_eng_display")
 
         top_n = st.sidebar.slider("Top N engaged people (0 = off)", 0, 50, 0, key="top_n")
@@ -1057,47 +1187,45 @@ def main():
             st.session_state["min_eng_display"] = int(min_eng)
             st.session_state["top_n"] = 0
             st.session_state["only_vendor_eval"] = False
+            st.session_state["lifecycle_stage"] = []
+            st.session_state["topic_filter"] = []
+            st.session_state["trigger_type_filter"] = []
 
         # Apply filters to a display copy
-        filt = pd.Series(True, index=inds_all.index)
-        if selected_topics:
-            topic_mask = pd.Series(False, index=inds_all.index)
-            for t in selected_topics:
-                topic_mask |= inds_all.get("Primary_Topic", pd.Series("", index=inds_all.index)).astype(object).fillna("").astype(str).str.contains(re.escape(t), case=False, na=False)
-            filt &= topic_mask
+        filt = pd.Series(True, index=inds_base.index)
         if selected_pv:
-            pv_mask = pd.Series(False, index=inds_all.index)
+            pv_mask = pd.Series(False, index=inds_base.index)
             for v in selected_pv:
-                pv_mask |= inds_all.get("Potential_Vendors", pd.Series("", index=inds_all.index)).astype(object).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
+                pv_mask |= inds_base.get("Potential_Vendors", pd.Series("", index=inds_base.index)).astype(object).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
             filt &= pv_mask
         if selected_ev:
-            ev_mask = pd.Series(False, index=inds_all.index)
+            ev_mask = pd.Series(False, index=inds_base.index)
             for v in selected_ev:
-                ev_mask |= inds_all.get("Vendors_Evaluated", pd.Series("", index=inds_all.index)).astype(object).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
+                ev_mask |= inds_base.get("Vendors_Evaluated", pd.Series("", index=inds_base.index)).astype(object).fillna("").astype(str).str.contains(re.escape(v), case=False, na=False)
             filt &= ev_mask
 
         if min_eng_display:
-            if "Total Engagements" in inds_all.columns:
-                filt &= inds_all["Total Engagements"] >= int(min_eng_display)
+            if "Total Engagements" in inds_base.columns:
+                filt &= inds_base["Total Engagements"] >= int(min_eng_display)
 
         # respect user's preference for which Buyer Journey label to use
-        if prefer_derived_stage and "Derived_Buyer_Journey" in inds_all.columns:
-            label_col = "Derived_Buyer_Journey"
-        elif "Derived_Buyer_Journey" in inds_all.columns:
-            label_col = "Derived_Buyer_Journey"
-        elif "Original_Buyer_Journey" in inds_all.columns:
-            label_col = "Original_Buyer_Journey"
+        if prefer_derived_stage:
+            label_col = "Buyer_Journey_Label_Derived" if "Buyer_Journey_Label_Derived" in inds_base.columns else "Buyer_Journey_Label"
         else:
-            label_col = None
-        if only_vendor_eval and label_col is not None:
-            if label_col in inds_all.columns:
-                filt &= inds_all[label_col] == "Vendor Evaluation"
+            label_col = "Buyer_Journey_Label"
 
-        inds_filtered = inds_all[filt].copy()
+        if only_vendor_eval:
+            if label_col in inds_base.columns:
+                filt &= inds_base[label_col] == "Vendor Evaluation"
+
+        inds_filtered = inds_base[filt].copy()
         if top_n and top_n > 0 and "Total Engagements" in inds_filtered.columns:
             inds_filtered = inds_filtered.sort_values("Total Engagements", ascending=False).head(top_n)
     else:
         inds_filtered = inds_all
+    # Show final count
+    st.sidebar.markdown(f"**Final display:** {len(inds_filtered):,} individuals")
+
 
     # UI: simplified view toggle and highlighted indicators
     # provide a compact/simple view toggle in the sidebar
@@ -1190,12 +1318,12 @@ def main():
         label_display = "Derived_Buyer_Journey_Label" if "Derived_Buyer_Journey_Label" in disp.columns else label_col
         cols_rest = [label_display, "Primary_Topic", "Potential_Vendors", "Vendors_Evaluated", "External_Trigger_Title", "External_Trigger_URL", "Intent_Score", "Intent_Label", "Confidence_Score"]
         show_cols = [c for c in (cols_base + cols_rest) if c in disp.columns]
-        disp_show = disp[show_cols].copy()
+        disp_show = deduplicate_columns(disp[show_cols].copy())
         st.dataframe(disp_show.head(200))
         with st.expander("Advanced: show all columns"):
-            st.dataframe(disp.head(200))
+            st.dataframe(deduplicate_columns(disp.copy()).head(200))
     else:
-        st.dataframe(disp.head(200))
+        st.dataframe(deduplicate_columns(disp.copy()).head(200))
 
     # Top insights: highlight companies with high intent and external triggers
     st.markdown("**Top Insights**")
@@ -1220,25 +1348,34 @@ def main():
         pass
 
     st.subheader("Company Summary")
-    st.dataframe(results["company_summary"].head(200))
+    company_summary = deduplicate_columns(results["company_summary"].copy())
+    st.dataframe(company_summary.head(200))
 
     st.subheader("Sales Hot List")
-    # Enforce sales hot list definition: only show rows with Intent_Score > 70 when available
+    # Sales Hot List: use the prefiltered list; do not re-filter here to avoid emptying
     sh = results.get("sales_hot_list", pd.DataFrame()).copy()
-    if not sh.empty:
-        if "Intent_Score" in sh.columns:
-            sh = sh[sh["Intent_Score"] > 70]
-        else:
-            # try to map back to individuals' Intent_Score if present
-            inds = results.get("individuals")
-            if inds is not None and "Intent_Score" in inds.columns and "User ID" in sh.columns:
-                sh = sh.merge(inds[["User ID", "Intent_Score"]], on="User ID", how="left")
-                sh = sh[sh["Intent_Score"] > 70]
-            else:
-                # no intent info; empty result
-                sh = sh.iloc[0:0]
-
+    sh = deduplicate_columns(sh)
+    st.caption(f"Sales Hot List rows: {len(sh)}")
     st.dataframe(sh.head(200))
+    with st.expander("Sales Hot List debug (counts)"):
+        inds_dbg = results.get("individuals", pd.DataFrame())
+        st.write({
+            "individuals_rows": len(inds_dbg),
+            "sales_hot_rows": len(sh),
+            "has_intent_score": "Intent_Score" in inds_dbg.columns,
+            "has_intent_base_score": "Intent_Base_Score" in inds_dbg.columns,
+            "has_bj_label": "Buyer_Journey_Label" in inds_dbg.columns,
+            "has_derived_bj": "Derived_Buyer_Journey" in inds_dbg.columns,
+        })
+        if not inds_dbg.empty:
+            counts = {}
+            if "Intent_Score" in inds_dbg.columns:
+                counts["Intent_Score>=70"] = int((inds_dbg["Intent_Score"].fillna(0).astype(int) >= 70).sum())
+            if "Buyer_Journey_Label" in inds_dbg.columns:
+                counts["Vendor_Eval_Label"] = int((inds_dbg["Buyer_Journey_Label"] == "Vendor Evaluation").sum())
+            if "Derived_Buyer_Journey" in inds_dbg.columns:
+                counts["Vendor_Eval_Derived"] = int((inds_dbg["Derived_Buyer_Journey"] == "Vendor Evaluation").sum())
+            st.write(counts)
 
     # optional enrichment
     if enrich:

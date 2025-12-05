@@ -1,165 +1,148 @@
-import os
-import time
-from typing import List, Optional
-import urllib.parse
-
-import requests
+import datetime
+from urllib.parse import quote
+import feedparser
 import streamlit as st
 
-try:
-    import feedparser
-except Exception:
-    feedparser = None
+MAX_TRIGGER_AGE_DAYS = 90
 
 TRIGGER_WEIGHTS = {
     "funding": 3,
     "facility_expansion": 3,
-    "new_hire": 2,
+    "acquisition": 3,
+    "divestiture": 2,
     "partnership": 2,
+    "vendor_contract": 3,
+    "product_launch": 2,
+    "regulatory_milestone": 3,
+    "new_hire": 2,
     "general_press": 1,
 }
 
 
-def infer_trigger_type(text: str) -> Optional[str]:
-    if not text or not isinstance(text, str) or not text.strip():
+def parse_rss_date(entry) -> datetime.date | None:
+    try:
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            dt = datetime.datetime(*entry.published_parsed[:6])
+            return dt.date()
+        if hasattr(entry, "updated_parsed") and entry.updated_parsed:
+            dt = datetime.datetime(*entry.updated_parsed[:6])
+            return dt.date()
+    except Exception:
+        pass
+    return None
+
+
+def compute_trigger_freshness_score(published_at: datetime.date | None) -> int:
+    if published_at is None:
+        return 0
+    try:
+        days = (datetime.date.today() - published_at).days
+    except Exception:
+        return 0
+    if days <= 30:
+        return 3
+    if days <= 90:
+        return 1
+    return 0
+
+
+def infer_trigger_type(text: str) -> str | None:
+    if not text:
         return None
     t = text.lower()
-    if any(k in t for k in ("raises", "series a", "series b", "series c", "$", "raised")):
+
+    if any(k in t for k in ("funding", "raised", "series", "seed", "venture")):
         return "funding"
-    if any(k in t for k in ("expands", "new facility", "new plant", "manufacturing site", "expansion", "inaugur")):
+    if any(k in t for k in ("facility", "factory", "manufactur", "plant", "expansion")):
         return "facility_expansion"
-    if any(k in t for k in ("appoints", "hires", "joins as", "new vp", "new director", "named as")):
-        return "new_hire"
-    if any(k in t for k in ("partners with", "collaborates with", "in collaboration with", "partnered with")):
+    if any(k in t for k in ("acquir", "acquisition", "acquired", "bought")):
+        return "acquisition"
+    if any(k in t for k in ("divest", "spinoff", "spin-off", "sold")):
+        return "divestiture"
+    if any(k in t for k in ("partner", "partnership", "collaborat", "alliance", "joint venture")):
         return "partnership"
+    if any(k in t for k in ("contract", "award", "won", "selected", "deal")):
+        return "vendor_contract"
+    if any(k in t for k in ("launch", "introduc", "released", "announce")):
+        return "product_launch"
+    if any(k in t for k in ("fda", "ce mark", "approval", "clearance", "regulator", "regulatory")):
+        return "regulatory_milestone"
+    if any(k in t for k in ("hire", "appointed", "joined", "named", "ceo", "cto")):
+        return "new_hire"
+
     return "general_press"
 
 
-def _fetch_google_news_rss(company_name: str, max_results: int = 5) -> List[dict]:
-    q = urllib.parse.quote(company_name)
-    url = f"https://news.google.com/rss/search?q={q}"
+def is_recent(published_at: datetime.date | None) -> bool:
+    if published_at is None:
+        return False
     try:
-        if feedparser:
-            feed = feedparser.parse(url)
-            items = []
-            for e in (feed.entries or [])[:max_results]:
-                items.append({
-                    "title": e.get("title", ""),
-                    "url": e.get("link", ""),
-                    "published_at": e.get("published", ""),
-                    "source": e.get("source", {}).get("title", "") if isinstance(e.get("source"), dict) else "",
-                })
-            return items
-        else:
-            r = requests.get(url, timeout=10)
-            if r.status_code != 200:
-                return []
-            # naive XML parse
-            from xml.etree import ElementTree as ET
+        return (datetime.date.today() - published_at).days <= MAX_TRIGGER_AGE_DAYS
+    except Exception:
+        return False
 
-            root = ET.fromstring(r.content)
-            items = []
-            for item in root.findall('.//item')[:max_results]:
-                title = item.findtext('title') or ""
-                link = item.findtext('link') or ""
-                pub = item.findtext('pubDate') or ""
-                items.append({"title": title, "url": link, "published_at": pub, "source": "Google News"})
-            return items
+
+@st.cache_data(ttl=86400)
+def fetch_company_news_from_rss(company_name: str, max_results: int = 10) -> list[dict]:
+    if not company_name or str(company_name).strip() == "":
+        return []
+    q = quote(str(company_name))
+    rss_url = f"https://news.google.com/rss/search?q={q}"
+
+    try:
+        feed = feedparser.parse(rss_url)
     except Exception:
         return []
 
+    items = []
+    entries = getattr(feed, "entries", [])
+    for e in entries[: max_results * 3]:
+        try:
+            title = getattr(e, "title", "")
+            link = getattr(e, "link", "")
+            pub = parse_rss_date(e)
+            if not link:
+                continue
+            if not is_recent(pub):
+                continue
+            items.append({"title": title, "url": link, "published_at": pub})
+            if len(items) >= max_results:
+                break
+        except Exception:
+            continue
+    return items
 
-def _fetch_newsapi(company_name: str, api_key: str, max_results: int = 5) -> List[dict]:
-    url = "https://newsapi.org/v2/everything"
-    q = f'"{company_name}" bioprocess OR biologics OR manufacturing'
-    params = {"q": q, "pageSize": max_results, "language": "en", "sortBy": "publishedAt", "apiKey": api_key}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return []
-        j = r.json()
-        items = []
-        for a in j.get("articles", [])[:max_results]:
-            items.append({
-                "title": a.get("title", ""),
-                "url": a.get("url", ""),
-                "published_at": a.get("publishedAt", ""),
-                "source": a.get("source", {}).get("name", ""),
+
+@st.cache_data(ttl=86400)
+def find_best_trigger_for_company(company_name: str) -> dict | None:
+    articles = fetch_company_news_from_rss(company_name, max_results=10)
+    candidates = []
+    for a in articles:
+        title = a.get("title", "")
+        url = a.get("url", "")
+        pub = a.get("published_at")
+        trigger_type = infer_trigger_type(title)
+        type_score = TRIGGER_WEIGHTS.get(trigger_type, 0)
+        freshness_score = compute_trigger_freshness_score(pub)
+        final_score = type_score + freshness_score
+        if final_score > 0:
+            candidates.append({
+                "title": title,
+                "url": url,
+                "published_at": pub,
+                "trigger_type": trigger_type,
+                "final_score": final_score,
             })
-        return items
-    except Exception:
-        return []
 
-
-@st.cache_data(show_spinner=False)
-def fetch_company_news(company_name: str, max_results: int = 5) -> List[dict]:
-    company_name = (company_name or "").strip()
-    if not company_name:
-        return []
-
-    results = []
-
-    newsapi_key = None
-    try:
-        newsapi_key = st.secrets.get("NEWSAPI_KEY") if hasattr(st, "secrets") else None
-    except Exception:
-        newsapi_key = os.environ.get("NEWSAPI_KEY")
-
-    if newsapi_key:
-        results.extend(_fetch_newsapi(company_name, newsapi_key, max_results=max_results))
-
-    # always try Google News RSS as fallback/augment
-    results.extend(_fetch_google_news_rss(company_name, max_results=max_results))
-
-    # dedupe by url
-    seen = set()
-    out = []
-    for r in results:
-        url = r.get("url") or r.get("link") or ""
-        if not url:
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        out.append(r)
-    return out
-
-
-@st.cache_data(show_spinner=False)
-def find_best_trigger_for_company(company_name: str) -> Optional[dict]:
-    articles = fetch_company_news(company_name, max_results=8)
-    if not articles:
+    if not candidates:
         return None
 
-    best = None
-    best_score = -1
-    best_time = None
-
-    for a in articles:
-        title = a.get("title", "") or ""
-        snippet = a.get("description", "") or ""
-        txt = (title + " " + snippet).strip()
-        ttype = infer_trigger_type(txt)
-        score = TRIGGER_WEIGHTS.get(ttype, 0)
-        # parse published time for tie-breaking if available
-        pub = a.get("published_at")
-        # simple epoch fallback
-        try:
-            # try ISO parse
-            from dateutil import parser as _p
-
-            pub_dt = _p.parse(pub) if pub else None
-        except Exception:
-            pub_dt = None
-
-        if score > best_score or (score == best_score and pub_dt and (best_time is None or pub_dt > best_time)):
-            best = {
-                "external_trigger_title": title,
-                "external_trigger_url": a.get("url", ""),
-                "external_trigger_type": ttype,
-                "external_trigger_score": int(score),
-            }
-            best_score = score
-            best_time = pub_dt
-
-    return best
+    candidates = sorted(candidates, key=lambda x: (-x["final_score"], x.get("published_at") or datetime.date.min))
+    best = candidates[0]
+    return {
+        "external_trigger_title": best.get("title", ""),
+        "external_trigger_url": best.get("url", ""),
+        "external_trigger_type": best.get("trigger_type", ""),
+        "external_trigger_score": int(best.get("final_score", 0)),
+        "external_trigger_date": best.get("published_at"),
+    }

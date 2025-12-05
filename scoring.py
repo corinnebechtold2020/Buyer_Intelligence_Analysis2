@@ -114,7 +114,7 @@ def compute_base_intent(individuals_df: pd.DataFrame, company_agg_df: pd.DataFra
     return df
 
 
-def enrich_with_external_triggers(individuals_df: pd.DataFrame) -> pd.DataFrame:
+def enrich_with_external_triggers(individuals_df: pd.DataFrame, org_column: str = "Reader Org") -> pd.DataFrame:
     df = individuals_df.copy()
     df["External_Trigger_Title"] = ""
     df["External_Trigger_URL"] = ""
@@ -128,7 +128,10 @@ def enrich_with_external_triggers(individuals_df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             base = 0
         if base >= 60:
-            comp = row.get("Reader Company", "")
+            comp = row.get(org_column, "")
+            # fall back to Reader Company if requested org column is empty
+            if not comp and org_column != "Reader Company":
+                comp = row.get("Reader Company", "")
             if not comp:
                 continue
             best = find_best_trigger_for_company(comp)
@@ -218,7 +221,7 @@ def enrich_with_external_triggers(individuals_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def apply_intent_scoring(individuals_df: pd.DataFrame, company_agg_df: pd.DataFrame) -> pd.DataFrame:
+def apply_intent_scoring(individuals_df: pd.DataFrame, company_agg_df: pd.DataFrame, org_column: str = "Reader Org") -> pd.DataFrame:
     base = compute_base_intent(individuals_df, company_agg_df)
-    enriched = enrich_with_external_triggers(base)
+    enriched = enrich_with_external_triggers(base, org_column=org_column)
     return enriched
