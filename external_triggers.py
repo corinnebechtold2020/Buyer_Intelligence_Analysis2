@@ -1,4 +1,6 @@
 import datetime
+import json
+from pathlib import Path
 from urllib.parse import quote
 import feedparser
 import streamlit as st
@@ -17,6 +19,48 @@ TRIGGER_WEIGHTS = {
     "new_hire": 2,
     "general_press": 1,
 }
+
+# Additional keyword signals provided by user
+# Grouped to contribute additive weights on top of base trigger type
+KEYWORD_SIGNALS = {
+    "high_intent": {
+        "weight": 3,
+        "keywords": [
+            "expansion", "facility", "new site", "groundbreaking", "ribbon cutting",
+            "capital investment", "manufacturing", "biomanufacturing", "scale-up",
+            "capacity increase", "large-scale", "gmp", "tech transfer", "commissioning",
+            "bioreactor", "single-use", "automation", "mes", "digital manufacturing",
+        ],
+    },
+    "strategic_ops": {
+        "weight": 2,
+        "keywords": [
+            "partnership", "collaboration", "agreement", "evaluation", "pilot run",
+            "process development", "msat", "upstream", "downstream", "cdmo selection",
+        ],
+    },
+    "corporate": {
+        "weight": 3,
+        "keywords": [
+            "acquisition", "merger", "divestiture", "funding", "financing",
+            "regulatory milestone", "bla", "nda", "ema", "fda approval",
+            "chief manufacturing officer", "svp manufacturing",
+        ],
+    },
+}
+
+# Optional per-company sources file (company press + RSS). If missing, fallback to Google News RSS only.
+NEWS_SOURCES_PATH = Path(__file__).resolve().parent / "news_sources.json"
+
+
+@st.cache_data
+def _load_news_sources() -> dict:
+    try:
+        if NEWS_SOURCES_PATH.exists():
+            return json.loads(NEWS_SOURCES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
 
 
 def parse_rss_date(entry) -> datetime.date | None:
@@ -82,12 +126,56 @@ def is_recent(published_at: datetime.date | None) -> bool:
         return False
 
 
+def _keyword_signal_score(text: str) -> int:
+    if not text:
+        return 0
+    t = text.lower()
+    score = 0
+    for bucket in KEYWORD_SIGNALS.values():
+        w = int(bucket.get("weight", 0))
+        for k in bucket.get("keywords", []):
+            if k and k in t:
+                score += w
+                break  # avoid double-counting within same bucket
+    return score
+
+
+def _find_company_sources(company_name: str) -> dict:
+    """Return mapping with possible keys: 'rss' (str|None), 'press' (str|None)."""
+    srcs = _load_news_sources()
+    if not srcs:
+        return {}
+    if not company_name:
+        return {}
+    cn = str(company_name).strip().lower()
+    # Try exact, then case-insensitive, then substring both ways
+    for k, v in srcs.items():
+        if k.strip().lower() == cn:
+            return v or {}
+    for k, v in srcs.items():
+        if cn == k.strip().lower():
+            return v or {}
+    for k, v in srcs.items():
+        kl = k.strip().lower()
+        if cn in kl or kl in cn:
+            return v or {}
+    return {}
+
+
 @st.cache_data(ttl=86400)
 def fetch_company_news_from_rss(company_name: str, max_results: int = 10) -> list[dict]:
     if not company_name or str(company_name).strip() == "":
         return []
-    q = quote(str(company_name))
-    rss_url = f"https://news.google.com/rss/search?q={q}"
+    # Prefer configured RSS for the specific company, else fallback to Google News RSS search
+    preferred = _find_company_sources(company_name)
+    rss_url = None
+    try:
+        rss_url = preferred.get("rss") if isinstance(preferred, dict) else None
+    except Exception:
+        rss_url = None
+    if not rss_url:
+        q = quote(str(company_name))
+        rss_url = f"https://news.google.com/rss/search?q={q}"
 
     try:
         feed = feedparser.parse(rss_url)
@@ -115,7 +203,7 @@ def fetch_company_news_from_rss(company_name: str, max_results: int = 10) -> lis
 
 @st.cache_data(ttl=86400)
 def find_best_trigger_for_company(company_name: str) -> dict | None:
-    articles = fetch_company_news_from_rss(company_name, max_results=10)
+    articles = fetch_company_news_from_rss(company_name, max_results=15)
     candidates = []
     for a in articles:
         title = a.get("title", "")
@@ -124,7 +212,8 @@ def find_best_trigger_for_company(company_name: str) -> dict | None:
         trigger_type = infer_trigger_type(title)
         type_score = TRIGGER_WEIGHTS.get(trigger_type, 0)
         freshness_score = compute_trigger_freshness_score(pub)
-        final_score = type_score + freshness_score
+        signal_score = _keyword_signal_score(title)
+        final_score = type_score + freshness_score + signal_score
         if final_score > 0:
             candidates.append({
                 "title": title,

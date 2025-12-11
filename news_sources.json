@@ -1,0 +1,86 @@
+{
+  "Pfizer": {
+    "press": "https://www.pfizer.com/news/press-releases",
+    "rss": "https://www.pfizer.com/news/press-releases/rss"
+  },
+  "Merck": {
+    "press": "https://www.merck.com/news/",
+    "rss": "https://www.merck.com/feed/"
+  },
+  "Johnson & Johnson": {
+    "press": "https://www.jnj.com/media-center/press-releases",
+    "rss": "https://www.jnj.com/media-center/rss"
+  },
+  "AstraZeneca": {
+    "press": "https://www.astrazeneca.com/media-centre/press-releases.html",
+    "rss": "https://www.astrazeneca.com/rss.xml"
+  },
+  "GSK": {
+    "press": "https://www.gsk.com/en-gb/media/press-releases/",
+    "rss": "https://www.gsk.com/en-gb/media/rss/press-releases/"
+  },
+  "Sanofi": {
+    "press": "https://www.sanofi.com/en/media-room/press-releases",
+    "rss": "https://www.sanofi.com/en/media-room/press-releases/rss"
+  },
+  "Novo Nordisk": {
+    "press": "https://www.novonordisk.com/news-and-media/",
+    "rss": "https://www.novonordisk.com/rss.xml"
+  },
+  "Novo Nordsk": {
+    "press": "https://www.novonordisk.com/news-and-media/",
+    "rss": "https://www.novonordisk.com/rss.xml"
+  },
+  "Eli Lilly": {
+    "press": "https://investor.lilly.com/news-releases",
+    "rss": null
+  },
+  "Roche": {
+    "press": "https://www.roche.com/media",
+    "rss": "https://www.roche.com/media/releases/rss.htm"
+  },
+  "BMS": {
+    "press": "https://www.bms.com/media/press-releases.html",
+    "rss": null
+  },
+  "AbbVie": {
+    "press": "https://news.abbvie.com/news/press-releases/",
+    "rss": null
+  },
+  "Amgen": {
+    "press": "https://www.amgen.com/newsroom",
+    "rss": "https://www.amgen.com/newsroom/rss-feeds"
+  },
+  "Novartis": {
+    "press": "https://www.novartis.com/news",
+    "rss": "https://www.novartis.com/news/rss"
+  },
+  "Gilead": {
+    "press": "https://www.gilead.com/news-and-press/press-room/press-releases",
+    "rss": null
+  },
+  "Takeda": {
+    "press": "https://www.takeda.com/newsroom/",
+    "rss": "https://www.takeda.com/newsroom/rss/"
+  },
+  "Moderna": {
+    "press": "https://investors.modernatx.com/news-releases",
+    "rss": null
+  },
+  "Biogen": {
+    "press": "https://investors.biogen.com/news-releases",
+    "rss": null
+  },
+  "Regeneron": {
+    "press": "https://investor.regeneron.com/news-releases",
+    "rss": null
+  },
+  "CSL Behring": {
+    "press": "https://www.cslbehring.com/newsroom",
+    "rss": null
+  },
+  "Vertex": {
+    "press": "https://news.vrtx.com/press-releases",
+    "rss": null
+  }
+}
